@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package token_management;
+
+option go_package = "tokenmanager/token_management;token_management";
+
+service TokenManager {
+  rpc WriteToken(WriteTokenMsg) returns (WriteResponse);
+  rpc ReadToken(Token) returns (WriteResponse);
+  rpc WriteBroadcast(WriteBroadcastRequest) returns (WriteBroadcastResponse);
+  rpc ReadBroadcast(ReadBroadcastRequest) returns (ReadBroadcastResponse);
+}
+
+message Token {
+  int32 token_id = 1;
+}
+
+message WriteTokenMsg {
+  int32 token_id = 1;
+  uint64 partial_value = 2;
+  string name = 3;
+  uint64 low = 4;
+  uint64 mid = 5;
+  uint64 high = 6;
+}
+
+message WriteResponse {
+  int32 ack = 1;
+  string message = 2;
+  string wts = 3;
+  uint64 finalVal = 4;
+  string name = 5;
+  uint64 low = 6;
+  uint64 mid = 7;
+  uint64 high = 8;
+  int32 token_id = 9;
+  string server = 10;
+}
+
+message WriteBroadcastRequest {
+  uint64 hash_val = 1;
+  bool reading_flag = 2;
+  int32 ack = 3;
+  string wts = 4;
+  string name = 5;
+  uint64 low = 6;
+  uint64 mid = 7;
+  uint64 high = 8;
+  int32 token_id = 9;
+  string server = 10;
+}
+
+message WriteBroadcastResponse {
+  int32 ack = 1;
+}
+
+message ReadBroadcastRequest {
+  int32 token_id = 1;
+}
+
+message ReadBroadcastResponse {
+  string wts = 1;
+  uint64 finalVal = 2;
+  string name = 3;
+  uint64 low = 4;
+  uint64 mid = 5;
+  uint64 high = 6;
+}

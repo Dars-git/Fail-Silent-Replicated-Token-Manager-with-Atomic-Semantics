@@ -1,0 +1,32 @@
+servers:
+  - name: s1
+    host: 127.0.0.1
+    port: 50051
+    sleep_ms: 0
+    negative_ack: false
+  - name: s2
+    host: 127.0.0.1
+    port: 50052
+    sleep_ms: 0
+    negative_ack: false
+  - name: s3
+    host: 127.0.0.1
+    port: 50053
+    sleep_ms: 0
+    negative_ack: false
+
+tokens:
+  - id: 1
+    writers: [s1]
+    readers: [s1, s2, s3]
+    replicas: [s1, s2, s3]
+
+  - id: 2
+    writers: [s2]
+    readers: [s1, s2, s3]
+    replicas: [s1, s2, s3]
+
+  - id: 3
+    writers: [s3]
+    readers: [s1, s2, s3]
+    replicas: [s1, s2, s3]
