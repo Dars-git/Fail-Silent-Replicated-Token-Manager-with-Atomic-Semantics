@@ -25,21 +25,94 @@ type readAck struct {
 	err  error
 }
 
+type peerTransport interface {
+	WriteBroadcast(ctx context.Context, peer config.ServerConfig, req *pb.WriteBroadcastRequest) (*pb.WriteBroadcastResponse, error)
+	ReadBroadcast(ctx context.Context, peer config.ServerConfig, tokenID int32) (*pb.ReadBroadcastResponse, error)
+}
+
+type grpcTransport struct{}
+
+func (grpcTransport) WriteBroadcast(ctx context.Context, peer config.ServerConfig, req *pb.WriteBroadcastRequest) (*pb.WriteBroadcastResponse, error) {
+	client, conn, err := clientForPeer(ctx, peer)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.WriteBroadcast(ctx, req)
+}
+
+func (grpcTransport) ReadBroadcast(ctx context.Context, peer config.ServerConfig, tokenID int32) (*pb.ReadBroadcastResponse, error) {
+	client, conn, err := clientForPeer(ctx, peer)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return client.ReadBroadcast(ctx, &pb.ReadBroadcastRequest{TokenId: tokenID})
+}
+
 type TokenManagerServer struct {
 	pb.UnimplementedTokenManagerServer
 
-	cfg              *config.Config
-	store            *tokenstore.Store
-	self             config.ServerConfig
-	requestTimeout   time.Duration
-	sequence         atomic.Uint64
+	cfg            *config.Config
+	store          *tokenstore.Store
+	self           config.ServerConfig
+	requestTimeout time.Duration
+	sequence       atomic.Uint64
+	transport      peerTransport
+	nowUnixNano    func() int64
+	nextSequence   func() uint64
+	metrics        *serverMetrics
+}
+
+func newTokenManagerServer(cfg *config.Config, store *tokenstore.Store, self config.ServerConfig, requestTimeout time.Duration) *TokenManagerServer {
+	s := &TokenManagerServer{
+		cfg:            cfg,
+		store:          store,
+		self:           self,
+		requestTimeout: requestTimeout,
+	}
+	s.ensureDefaults()
+	return s
+}
+
+func (s *TokenManagerServer) ensureDefaults() {
+	if s.transport == nil {
+		s.transport = grpcTransport{}
+	}
+	if s.nowUnixNano == nil {
+		s.nowUnixNano = func() int64 { return time.Now().UnixNano() }
+	}
+	if s.nextSequence == nil {
+		s.nextSequence = func() uint64 { return s.sequence.Add(1) }
+	}
+	if s.metrics == nil {
+		s.metrics = newServerMetrics()
+	}
+}
+
+func requiredQuorum(totalReplicas int) int {
+	if totalReplicas <= 0 {
+		return 0
+	}
+	return totalReplicas/2 + 1
+}
+
+func hasQuorum(ackCount, totalReplicas int) bool {
+	return ackCount >= requiredQuorum(totalReplicas)
 }
 
 func (s *TokenManagerServer) WriteToken(ctx context.Context, in *pb.WriteTokenMsg) (*pb.WriteResponse, error) {
+	s.ensureDefaults()
+	start := time.Now()
+	s.metrics.incWriteTokenCalls()
+	defer s.metrics.observeWriteTokenLatency(time.Since(start))
+
 	if in == nil {
+		s.metrics.incWriteTokenErrors()
 		return nil, errors.New("empty write request")
 	}
 	if !s.cfg.IsWriter(s.self.Name, in.TokenId) {
+		s.metrics.incWriteTokenAuthFailures()
 		return &pb.WriteResponse{Ack: 0, Message: "write authorization failed", TokenId: in.TokenId, Server: s.self.Name}, nil
 	}
 
@@ -61,10 +134,11 @@ func (s *TokenManagerServer) WriteToken(ctx context.Context, in *pb.WriteTokenMs
 
 	replicas := s.cfg.ReplicaServers(in.TokenId)
 	if len(replicas) == 0 {
+		s.metrics.incWriteTokenErrors()
 		return &pb.WriteResponse{Ack: 0, Message: "no replica nodes found for token", TokenId: in.TokenId, Server: s.self.Name}, nil
 	}
 
-	majority := len(replicas)/2 + 1
+	majority := requiredQuorum(len(replicas))
 	ackCount := 0
 
 	ackCh := make(chan int32, len(replicas))
@@ -77,7 +151,7 @@ func (s *TokenManagerServer) WriteToken(ctx context.Context, in *pb.WriteTokenMs
 		}
 
 		wg.Add(1)
-		go s.startBroadcast(&wg, peer, &pb.WriteBroadcastRequest{
+		go s.startBroadcast(ctx, &wg, peer, &pb.WriteBroadcastRequest{
 			HashVal:     partialVal,
 			ReadingFlag: false,
 			Ack:         0,
@@ -101,7 +175,8 @@ func (s *TokenManagerServer) WriteToken(ctx context.Context, in *pb.WriteTokenMs
 
 	msg := "write committed with quorum"
 	ack := int32(1)
-	if ackCount < majority {
+	if !hasQuorum(ackCount, len(replicas)) {
+		s.metrics.incQuorumFailures()
 		ack = 0
 		msg = fmt.Sprintf("write failed quorum: got %d/%d acks", ackCount, majority)
 	}
@@ -121,10 +196,17 @@ func (s *TokenManagerServer) WriteToken(ctx context.Context, in *pb.WriteTokenMs
 }
 
 func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.WriteResponse, error) {
+	s.ensureDefaults()
+	start := time.Now()
+	s.metrics.incReadTokenCalls()
+	defer s.metrics.observeReadTokenLatency(time.Since(start))
+
 	if in == nil {
+		s.metrics.incReadTokenErrors()
 		return nil, errors.New("empty read request")
 	}
 	if !s.cfg.IsReader(s.self.Name, in.TokenId) {
+		s.metrics.incReadTokenAuthFailures()
 		return &pb.WriteResponse{Ack: 0, Message: "read authorization failed", TokenId: in.TokenId, Server: s.self.Name}, nil
 	}
 
@@ -134,6 +216,7 @@ func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.W
 
 	replicas := s.cfg.ReplicaServers(in.TokenId)
 	if len(replicas) == 0 {
+		s.metrics.incReadTokenErrors()
 		return &pb.WriteResponse{Ack: 0, Message: "no replica nodes found for token", TokenId: in.TokenId, Server: s.self.Name}, nil
 	}
 
@@ -150,7 +233,7 @@ func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.W
 			continue
 		}
 		wg.Add(1)
-		go s.startReadBroadcast(&wg, peer, in.TokenId, readCh)
+		go s.startReadBroadcast(ctx, &wg, peer, in.TokenId, readCh)
 	}
 
 	wg.Wait()
@@ -174,11 +257,12 @@ func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.W
 	}
 
 	if best.WTS == "" {
+		s.metrics.incReadTokenErrors()
 		return &pb.WriteResponse{Ack: 0, Message: "token has no value yet", TokenId: in.TokenId, Server: s.self.Name}, nil
 	}
 
 	// Read-impose-write-all write-back.
-	majority := len(replicas)/2 + 1
+	majority := requiredQuorum(len(replicas))
 	ackCount := 0
 	ackCh := make(chan int32, len(replicas))
 	var wbWG sync.WaitGroup
@@ -191,7 +275,7 @@ func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.W
 		}
 
 		wbWG.Add(1)
-		go s.startBroadcast(&wbWG, peer, &pb.WriteBroadcastRequest{
+		go s.startBroadcast(ctx, &wbWG, peer, &pb.WriteBroadcastRequest{
 			HashVal:     best.PartialVal,
 			ReadingFlag: true,
 			Ack:         0,
@@ -215,7 +299,8 @@ func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.W
 
 	msg := "read served and write-back completed"
 	ack := int32(1)
-	if ackCount < majority {
+	if !hasQuorum(ackCount, len(replicas)) {
+		s.metrics.incQuorumFailures()
 		ack = 0
 		msg = fmt.Sprintf("read served but write-back quorum failed: got %d/%d acks", ackCount, majority)
 	}
@@ -235,7 +320,13 @@ func (s *TokenManagerServer) ReadToken(ctx context.Context, in *pb.Token) (*pb.W
 }
 
 func (s *TokenManagerServer) WriteBroadcast(ctx context.Context, in *pb.WriteBroadcastRequest) (*pb.WriteBroadcastResponse, error) {
+	s.ensureDefaults()
+	start := time.Now()
+	s.metrics.incWriteBroadcastCalls()
+	defer s.metrics.observeWriteBroadcastLatency(time.Since(start))
+
 	if in == nil {
+		s.metrics.incWriteBroadcastErrors()
 		return nil, errors.New("empty write broadcast request")
 	}
 	if s.self.SleepMs > 0 {
@@ -247,6 +338,7 @@ func (s *TokenManagerServer) WriteBroadcast(ctx context.Context, in *pb.WriteBro
 
 	_, tokenKnown := s.cfg.TokenByID(in.TokenId)
 	if !tokenKnown {
+		s.metrics.incWriteBroadcastErrors()
 		return &pb.WriteBroadcastResponse{Ack: 0}, nil
 	}
 
@@ -266,7 +358,13 @@ func (s *TokenManagerServer) WriteBroadcast(ctx context.Context, in *pb.WriteBro
 }
 
 func (s *TokenManagerServer) ReadBroadcast(ctx context.Context, in *pb.ReadBroadcastRequest) (*pb.ReadBroadcastResponse, error) {
+	s.ensureDefaults()
+	start := time.Now()
+	s.metrics.incReadBroadcastCalls()
+	defer s.metrics.observeReadBroadcastLatency(time.Since(start))
+
 	if in == nil {
+		s.metrics.incReadBroadcastErrors()
 		return nil, errors.New("empty read broadcast request")
 	}
 	if s.self.SleepMs > 0 {
@@ -286,50 +384,62 @@ func (s *TokenManagerServer) ReadBroadcast(ctx context.Context, in *pb.ReadBroad
 	}, nil
 }
 
-func (s *TokenManagerServer) startBroadcast(wg *sync.WaitGroup, peer config.ServerConfig, req *pb.WriteBroadcastRequest, ackCh chan<- int32) {
+func (s *TokenManagerServer) startBroadcast(parentCtx context.Context, wg *sync.WaitGroup, peer config.ServerConfig, req *pb.WriteBroadcastRequest, ackCh chan<- int32) {
 	defer wg.Done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.requestTimeout)
-	defer cancel()
+	ctx := parentCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.requestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.requestTimeout)
+		defer cancel()
+	}
 
-	client, conn, err := s.clientForPeer(peer)
+	resp, err := s.transport.WriteBroadcast(ctx, peer, req)
 	if err != nil {
+		s.metrics.incOutboundBroadcastErrors()
 		ackCh <- 0
 		return
 	}
-	defer conn.Close()
-
-	resp, err := client.WriteBroadcast(ctx, req)
-	if err != nil || resp == nil {
+	if resp == nil {
 		ackCh <- 0
 		return
 	}
 	ackCh <- resp.Ack
 }
 
-func (s *TokenManagerServer) startReadBroadcast(wg *sync.WaitGroup, peer config.ServerConfig, tokenID int32, readCh chan<- readAck) {
+func (s *TokenManagerServer) startReadBroadcast(parentCtx context.Context, wg *sync.WaitGroup, peer config.ServerConfig, tokenID int32, readCh chan<- readAck) {
 	defer wg.Done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.requestTimeout)
-	defer cancel()
+	ctx := parentCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.requestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.requestTimeout)
+		defer cancel()
+	}
 
-	client, conn, err := s.clientForPeer(peer)
+	resp, err := s.transport.ReadBroadcast(ctx, peer, tokenID)
 	if err != nil {
+		s.metrics.incOutboundReadBroadcastErrors()
 		readCh <- readAck{err: err}
 		return
 	}
-	defer conn.Close()
-
-	resp, err := client.ReadBroadcast(ctx, &pb.ReadBroadcastRequest{TokenId: tokenID})
 	readCh <- readAck{resp: resp, err: err}
 }
 
-func (s *TokenManagerServer) clientForPeer(peer config.ServerConfig) (pb.TokenManagerClient, *grpc.ClientConn, error) {
+func clientForPeer(ctx context.Context, peer config.ServerConfig) (pb.TokenManagerClient, *grpc.ClientConn, error) {
 	addr := fmt.Sprintf("%s:%d", peer.Host, peer.Port)
-	conn, err := grpc.Dial(
+	conn, err := grpc.DialContext(
+		ctx,
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.CallContentSubtype("json")),
+		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -338,8 +448,9 @@ func (s *TokenManagerServer) clientForPeer(peer config.ServerConfig) (pb.TokenMa
 }
 
 func (s *TokenManagerServer) nextWTS() string {
-	n := time.Now().UnixNano()
-	seq := s.sequence.Add(1)
+	s.ensureDefaults()
+	n := s.nowUnixNano()
+	seq := s.nextSequence()
 	return fmt.Sprintf("%020d-%s-%06d", n, s.self.Name, seq)
 }
 
@@ -386,12 +497,7 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterTokenManagerServer(grpcServer, &TokenManagerServer{
-		cfg:            cfg,
-		store:          store,
-		self:           self,
-		requestTimeout: 3 * time.Second,
-	})
+	pb.RegisterTokenManagerServer(grpcServer, newTokenManagerServer(cfg, store, self, 3*time.Second))
 
 	log.Printf("token server started: %s (%s:%d) sleep_ms=%d negative_ack=%v", self.Name, *host, *port, self.SleepMs, self.NegativeAck)
 	if err := grpcServer.Serve(lis); err != nil {

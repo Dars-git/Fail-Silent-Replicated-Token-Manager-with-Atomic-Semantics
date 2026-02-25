@@ -61,6 +61,9 @@ func Load(path string) (*Config, error) {
 			c.Tokens[i].Replicas = dedupeStrings(append(append([]string{}, c.Tokens[i].Readers...), c.Tokens[i].Writers...))
 		}
 	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
 
 	c.ensureIndexes()
 
@@ -164,4 +167,59 @@ func dedupeStrings(in []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+func (c *Config) validate() error {
+	knownServers := make(map[string]struct{}, len(c.Servers))
+	knownPorts := make(map[int]struct{}, len(c.Servers))
+	for _, s := range c.Servers {
+		if s.Name == "" {
+			return fmt.Errorf("server has empty name")
+		}
+		if s.Port <= 0 {
+			return fmt.Errorf("server %q has invalid port %d", s.Name, s.Port)
+		}
+		if _, exists := knownServers[s.Name]; exists {
+			return fmt.Errorf("duplicate server name %q", s.Name)
+		}
+		if _, exists := knownPorts[s.Port]; exists {
+			return fmt.Errorf("duplicate server port %d", s.Port)
+		}
+		knownServers[s.Name] = struct{}{}
+		knownPorts[s.Port] = struct{}{}
+	}
+
+	knownTokens := make(map[int32]struct{}, len(c.Tokens))
+	for _, t := range c.Tokens {
+		if _, exists := knownTokens[t.ID]; exists {
+			return fmt.Errorf("duplicate token id %d", t.ID)
+		}
+		knownTokens[t.ID] = struct{}{}
+		if len(t.Readers) == 0 {
+			return fmt.Errorf("token %d has no readers", t.ID)
+		}
+		if len(t.Writers) == 0 {
+			return fmt.Errorf("token %d has no writers", t.ID)
+		}
+		if len(t.Replicas) == 0 {
+			return fmt.Errorf("token %d has no replicas", t.ID)
+		}
+		for _, reader := range dedupeStrings(t.Readers) {
+			if _, ok := knownServers[reader]; !ok {
+				return fmt.Errorf("token %d has unknown reader %q", t.ID, reader)
+			}
+		}
+		for _, writer := range dedupeStrings(t.Writers) {
+			if _, ok := knownServers[writer]; !ok {
+				return fmt.Errorf("token %d has unknown writer %q", t.ID, writer)
+			}
+		}
+		for _, replica := range dedupeStrings(t.Replicas) {
+			if _, ok := knownServers[replica]; !ok {
+				return fmt.Errorf("token %d has unknown replica %q", t.ID, replica)
+			}
+		}
+	}
+
+	return nil
 }

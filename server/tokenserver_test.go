@@ -12,12 +12,7 @@ import (
 )
 
 func newTestServer(cfg *config.Config, self config.ServerConfig) *TokenManagerServer {
-	return &TokenManagerServer{
-		cfg:            cfg,
-		store:          tokenstore.New(),
-		self:           self,
-		requestTimeout: 100 * time.Millisecond,
-	}
+	return newTokenManagerServer(cfg, tokenstore.New(), self, 100*time.Millisecond)
 }
 
 func TestWriteTokenNilRequest(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -92,5 +93,97 @@ func TestReplicaServersDedupesAndFiltersUnknown(t *testing.T) {
 	wantPorts := []int{5001, 5002, 5003}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Fatalf("unexpected sorted replica ports: got %v want %v", gotPorts, wantPorts)
+	}
+}
+
+func TestLoadValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		yaml      string
+		wantError string
+	}{
+		{
+			name: "duplicate server name",
+			yaml: `
+servers:
+  - name: s1
+    host: 127.0.0.1
+    port: 5001
+  - name: s1
+    host: 127.0.0.1
+    port: 5002
+tokens:
+  - id: 1
+    readers: [s1]
+    writers: [s1]
+`,
+			wantError: "duplicate server name",
+		},
+		{
+			name: "duplicate server port",
+			yaml: `
+servers:
+  - name: s1
+    host: 127.0.0.1
+    port: 5001
+  - name: s2
+    host: 127.0.0.1
+    port: 5001
+tokens:
+  - id: 1
+    readers: [s1]
+    writers: [s1]
+`,
+			wantError: "duplicate server port",
+		},
+		{
+			name: "missing readers",
+			yaml: `
+servers:
+  - name: s1
+    host: 127.0.0.1
+    port: 5001
+tokens:
+  - id: 1
+    readers: []
+    writers: [s1]
+`,
+			wantError: "has no readers",
+		},
+		{
+			name: "unknown writer",
+			yaml: `
+servers:
+  - name: s1
+    host: 127.0.0.1
+    port: 5001
+tokens:
+  - id: 1
+    readers: [s1]
+    writers: [s2]
+`,
+			wantError: "unknown writer",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "token_config.yml")
+			if err := os.WriteFile(cfgPath, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := Load(cfgPath)
+			if err == nil {
+				t.Fatalf("expected load validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
