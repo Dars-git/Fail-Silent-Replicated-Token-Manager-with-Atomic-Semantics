@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,14 +12,20 @@ import (
 type Config struct {
 	Servers []ServerConfig `yaml:"servers"`
 	Tokens  []TokenConfig  `yaml:"tokens"`
+
+	once            sync.Once                `yaml:"-"`
+	serverByPort    map[int]ServerConfig     `yaml:"-"`
+	serverByName    map[string]ServerConfig  `yaml:"-"`
+	tokenByID       map[int32]TokenConfig    `yaml:"-"`
+	replicasByToken map[int32][]ServerConfig `yaml:"-"`
 }
 
 type ServerConfig struct {
-	Name      string `yaml:"name"`
-	Host      string `yaml:"host"`
-	Port      int    `yaml:"port"`
-	SleepMs   int    `yaml:"sleep_ms"`
-	NegativeAck bool `yaml:"negative_ack"`
+	Name        string `yaml:"name"`
+	Host        string `yaml:"host"`
+	Port        int    `yaml:"port"`
+	SleepMs     int    `yaml:"sleep_ms"`
+	NegativeAck bool   `yaml:"negative_ack"`
 }
 
 type TokenConfig struct {
@@ -54,35 +61,59 @@ func Load(path string) (*Config, error) {
 			c.Tokens[i].Replicas = dedupeStrings(append(append([]string{}, c.Tokens[i].Readers...), c.Tokens[i].Writers...))
 		}
 	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+
+	c.ensureIndexes()
 
 	return &c, nil
 }
 
-func (c *Config) ServerByPort(port int) (ServerConfig, bool) {
-	for _, s := range c.Servers {
-		if s.Port == port {
-			return s, true
+func (c *Config) ensureIndexes() {
+	c.once.Do(func() {
+		c.serverByPort = make(map[int]ServerConfig, len(c.Servers))
+		c.serverByName = make(map[string]ServerConfig, len(c.Servers))
+		for _, s := range c.Servers {
+			c.serverByPort[s.Port] = s
+			c.serverByName[s.Name] = s
 		}
-	}
-	return ServerConfig{}, false
+
+		c.tokenByID = make(map[int32]TokenConfig, len(c.Tokens))
+		c.replicasByToken = make(map[int32][]ServerConfig, len(c.Tokens))
+		for _, t := range c.Tokens {
+			c.tokenByID[t.ID] = t
+			replicas := make([]ServerConfig, 0, len(t.Replicas))
+			for _, name := range dedupeStrings(t.Replicas) {
+				s, ok := c.serverByName[name]
+				if ok {
+					replicas = append(replicas, s)
+				}
+			}
+			sort.Slice(replicas, func(i, j int) bool {
+				return replicas[i].Port < replicas[j].Port
+			})
+			c.replicasByToken[t.ID] = replicas
+		}
+	})
+}
+
+func (c *Config) ServerByPort(port int) (ServerConfig, bool) {
+	c.ensureIndexes()
+	s, ok := c.serverByPort[port]
+	return s, ok
 }
 
 func (c *Config) ServerByName(name string) (ServerConfig, bool) {
-	for _, s := range c.Servers {
-		if s.Name == name {
-			return s, true
-		}
-	}
-	return ServerConfig{}, false
+	c.ensureIndexes()
+	s, ok := c.serverByName[name]
+	return s, ok
 }
 
 func (c *Config) TokenByID(id int32) (TokenConfig, bool) {
-	for _, t := range c.Tokens {
-		if t.ID == id {
-			return t, true
-		}
-	}
-	return TokenConfig{}, false
+	c.ensureIndexes()
+	t, ok := c.tokenByID[id]
+	return t, ok
 }
 
 func (c *Config) IsReader(server string, tokenID int32) bool {
@@ -112,20 +143,13 @@ func (c *Config) IsWriter(server string, tokenID int32) bool {
 }
 
 func (c *Config) ReplicaServers(tokenID int32) []ServerConfig {
-	t, ok := c.TokenByID(tokenID)
+	c.ensureIndexes()
+	replicas, ok := c.replicasByToken[tokenID]
 	if !ok {
 		return nil
 	}
-	out := make([]ServerConfig, 0, len(t.Replicas))
-	for _, name := range dedupeStrings(t.Replicas) {
-		s, ok := c.ServerByName(name)
-		if ok {
-			out = append(out, s)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Port < out[j].Port
-	})
+	out := make([]ServerConfig, len(replicas))
+	copy(out, replicas)
 	return out
 }
 
@@ -143,4 +167,59 @@ func dedupeStrings(in []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+func (c *Config) validate() error {
+	knownServers := make(map[string]struct{}, len(c.Servers))
+	knownPorts := make(map[int]struct{}, len(c.Servers))
+	for _, s := range c.Servers {
+		if s.Name == "" {
+			return fmt.Errorf("server has empty name")
+		}
+		if s.Port <= 0 {
+			return fmt.Errorf("server %q has invalid port %d", s.Name, s.Port)
+		}
+		if _, exists := knownServers[s.Name]; exists {
+			return fmt.Errorf("duplicate server name %q", s.Name)
+		}
+		if _, exists := knownPorts[s.Port]; exists {
+			return fmt.Errorf("duplicate server port %d", s.Port)
+		}
+		knownServers[s.Name] = struct{}{}
+		knownPorts[s.Port] = struct{}{}
+	}
+
+	knownTokens := make(map[int32]struct{}, len(c.Tokens))
+	for _, t := range c.Tokens {
+		if _, exists := knownTokens[t.ID]; exists {
+			return fmt.Errorf("duplicate token id %d", t.ID)
+		}
+		knownTokens[t.ID] = struct{}{}
+		if len(t.Readers) == 0 {
+			return fmt.Errorf("token %d has no readers", t.ID)
+		}
+		if len(t.Writers) == 0 {
+			return fmt.Errorf("token %d has no writers", t.ID)
+		}
+		if len(t.Replicas) == 0 {
+			return fmt.Errorf("token %d has no replicas", t.ID)
+		}
+		for _, reader := range dedupeStrings(t.Readers) {
+			if _, ok := knownServers[reader]; !ok {
+				return fmt.Errorf("token %d has unknown reader %q", t.ID, reader)
+			}
+		}
+		for _, writer := range dedupeStrings(t.Writers) {
+			if _, ok := knownServers[writer]; !ok {
+				return fmt.Errorf("token %d has unknown writer %q", t.ID, writer)
+			}
+		}
+		for _, replica := range dedupeStrings(t.Replicas) {
+			if _, ok := knownServers[replica]; !ok {
+				return fmt.Errorf("token %d has unknown replica %q", t.ID, replica)
+			}
+		}
+	}
+
+	return nil
 }
